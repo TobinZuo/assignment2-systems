@@ -1,0 +1,13 @@
+model_size,mode,batch_size,context_length,warmup_steps,measure_steps,mean_ms,std_ms,device,precision,basics_impl,error
+small,forward,4,512,5,10,31.94914534687996,0.11179435959674773,cuda,fp32,user-adapters,
+small,forward_backward,4,512,5,10,97.26915583014488,0.33144581132392276,cuda,fp32,user-adapters,
+small,train_step,4,512,5,10,103.46655324101448,0.19704942884781734,cuda,fp32,user-adapters,
+medium,forward,4,512,5,10,95.46940475702286,0.3446184124628487,cuda,fp32,user-adapters,
+medium,forward_backward,4,512,5,10,294.584833830595,0.17650896817256786,cuda,fp32,user-adapters,
+medium,train_step,4,512,5,10,315.6041517853737,0.47136407758699383,cuda,fp32,user-adapters,
+large,forward,4,512,5,10,218.49894374608994,0.357992316675247,cuda,fp32,user-adapters,
+large,forward_backward,4,512,5,10,654.8164896667004,0.8403407223429905,cuda,fp32,user-adapters,
+large,train_step,4,512,5,10,709.8816253244877,0.8815608400430965,cuda,fp32,user-adapters,
+xl,forward,4,512,5,10,637.7355739474297,4.530026062872468,cuda,fp32,user-adapters,
+xl,forward_backward,4,512,5,10,1700.0044487416744,5.728894316471669,cuda,fp32,user-adapters,
+xl,train_step,4,512,5,10,,,cuda,fp32,user-adapters,"torch.OutOfMemoryError: CUDA out of memory. Tried to allocate 100.00 MiB. GPU 0 has a total capacity of 44.53 GiB of which 19.94 MiB is free. Process 1932383 has 44.50 GiB memory in use. Of the allocated memory 43.39 GiB is allocated by PyTorch, and 788.60 MiB is reserved by PyTorch but unallocated. If reserved but unallocated memory is large try setting PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True to avoid fragmentation.  See documentation for Memory Management  (https://pytorch.org/docs/stable/notes/cuda.html#environment-variables)"

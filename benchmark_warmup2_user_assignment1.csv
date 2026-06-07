@@ -1,0 +1,4 @@
+model_size,mode,batch_size,context_length,warmup_steps,measure_steps,mean_ms,std_ms,device,precision,basics_impl,error
+small,forward,4,512,2,10,31.956209987401962,0.2668305598466299,cuda,fp32,user-adapters,
+small,forward_backward,4,512,2,10,97.45816513895988,0.48928389905739467,cuda,fp32,user-adapters,
+small,train_step,4,512,2,10,103.71151939034462,0.29405588680631806,cuda,fp32,user-adapters,

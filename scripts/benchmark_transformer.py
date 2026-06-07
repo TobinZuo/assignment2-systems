@@ -1,20 +1,21 @@
 from __future__ import annotations
 
 import argparse
+import importlib.util
 import json
 import statistics
+import sys
 import time
 from dataclasses import asdict, dataclass
+from pathlib import Path
 from typing import Literal
 
 import torch
 import torch.nn.functional as F
 
-from cs336_basics.model import BasicsTransformerLM
-from cs336_basics.optimizer import AdamW
-
 
 Mode = Literal["forward", "forward_backward", "train_step"]
+BasicsImpl = Literal["staff", "user-adapters"]
 
 
 @dataclass(frozen=True)
@@ -39,6 +40,7 @@ class BenchmarkResult:
     std_ms: float
     device: str
     precision: str
+    basics_impl: str
 
 
 def parse_args() -> argparse.Namespace:
@@ -51,6 +53,12 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--measure-steps", type=int, default=10)
     parser.add_argument("--device", default="cuda" if torch.cuda.is_available() else "cpu")
     parser.add_argument("--precision", choices=["fp32"], default="fp32")
+    parser.add_argument("--basics-impl", choices=["staff", "user-adapters"], default="staff")
+    parser.add_argument(
+        "--assignment1-path",
+        type=Path,
+        default=Path("/mnt/bn/ai-infra-aigc-my/mlx/users/zuotongbin.tobin/playground/assignment1-basics"),
+    )
     parser.add_argument("--seed", type=int, default=0)
     parser.add_argument("--output-format", choices=["table", "json"], default="table")
     return parser.parse_args()
@@ -70,15 +78,78 @@ def get_model_config(model_size: str, context_length: int) -> ModelConfig:
     )
 
 
-def build_model(config: ModelConfig, device: torch.device) -> BasicsTransformerLM:
-    model = BasicsTransformerLM(
-        vocab_size=config.vocab_size,
-        context_length=config.context_length,
-        d_model=config.d_model,
-        num_layers=config.num_layers,
-        num_heads=config.num_heads,
-        d_ff=config.d_ff,
-    )
+class UserAdapterTransformerLM(torch.nn.Module):
+    def __init__(self, config: ModelConfig, adapters, rope_theta: float = 10_000.0):
+        super().__init__()
+        self.config = config
+        self.adapters = adapters
+        self.rope_theta = rope_theta
+        self.names = []
+        self.params = torch.nn.ParameterList()
+        self._add_weight("token_embeddings.weight", (config.vocab_size, config.d_model))
+        for layer_idx in range(config.num_layers):
+            prefix = f"layers.{layer_idx}."
+            self._add_weight(prefix + "attn.q_proj.weight", (config.d_model, config.d_model))
+            self._add_weight(prefix + "attn.k_proj.weight", (config.d_model, config.d_model))
+            self._add_weight(prefix + "attn.v_proj.weight", (config.d_model, config.d_model))
+            self._add_weight(prefix + "attn.output_proj.weight", (config.d_model, config.d_model))
+            self._add_weight(prefix + "ln1.weight", (config.d_model,), init="ones")
+            self._add_weight(prefix + "ffn.w1.weight", (config.d_ff, config.d_model))
+            self._add_weight(prefix + "ffn.w2.weight", (config.d_model, config.d_ff))
+            self._add_weight(prefix + "ffn.w3.weight", (config.d_ff, config.d_model))
+            self._add_weight(prefix + "ln2.weight", (config.d_model,), init="ones")
+        self._add_weight("ln_final.weight", (config.d_model,), init="ones")
+        self._add_weight("lm_head.weight", (config.vocab_size, config.d_model))
+
+    def _add_weight(self, name: str, shape: tuple[int, ...], init: str = "normal") -> None:
+        if init == "ones":
+            param = torch.nn.Parameter(torch.ones(shape))
+        else:
+            param = torch.nn.Parameter(torch.empty(shape))
+            torch.nn.init.trunc_normal_(param, std=0.02, a=-0.06, b=0.06)
+        self.names.append(name)
+        self.params.append(param)
+
+    def forward(self, input_ids: torch.Tensor) -> torch.Tensor:
+        weights = {name: param for name, param in zip(self.names, self.params)}
+        return self.adapters.run_transformer_lm(
+            vocab_size=self.config.vocab_size,
+            context_length=self.config.context_length,
+            d_model=self.config.d_model,
+            num_layers=self.config.num_layers,
+            num_heads=self.config.num_heads,
+            d_ff=self.config.d_ff,
+            rope_theta=self.rope_theta,
+            weights=weights,
+            in_indices=input_ids,
+        )
+
+
+def load_user_adapters(assignment1_path: Path):
+    sys.path.insert(0, str(assignment1_path))
+    adapters_path = assignment1_path / "tests" / "adapters.py"
+    spec = importlib.util.spec_from_file_location("assignment1_user_adapters", adapters_path)
+    if spec is None or spec.loader is None:
+        raise RuntimeError(f"Unable to load adapters from {adapters_path}")
+    module = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(module)
+    return module
+
+
+def build_model(config: ModelConfig, device: torch.device, basics_impl: BasicsImpl, assignment1_path: Path) -> torch.nn.Module:
+    if basics_impl == "staff":
+        from cs336_basics.model import BasicsTransformerLM
+
+        model = BasicsTransformerLM(
+            vocab_size=config.vocab_size,
+            context_length=config.context_length,
+            d_model=config.d_model,
+            num_layers=config.num_layers,
+            num_heads=config.num_heads,
+            d_ff=config.d_ff,
+        )
+    else:
+        model = UserAdapterTransformerLM(config=config, adapters=load_user_adapters(assignment1_path))
     return model.to(device)
 
 
@@ -105,7 +176,11 @@ def make_batch(
     return input_ids, targets
 
 
-def build_optimizer(model: torch.nn.Module) -> torch.optim.Optimizer:
+def build_optimizer(model: torch.nn.Module, basics_impl: BasicsImpl, assignment1_path: Path) -> torch.optim.Optimizer:
+    if basics_impl == "staff":
+        from cs336_basics.optimizer import AdamW
+    else:
+        AdamW = load_user_adapters(assignment1_path).get_adamw_cls()
     return AdamW(model.parameters(), lr=1e-3)
 
 
@@ -189,6 +264,7 @@ def benchmark(
     context_length: int,
     device: torch.device,
     precision: str,
+    basics_impl: str,
 ) -> BenchmarkResult:
     run_warmup(
         warmup_steps=warmup_steps,
@@ -215,6 +291,7 @@ def benchmark(
         std_ms=statistics.stdev(step_times_ms) if len(step_times_ms) > 1 else 0.0,
         device=str(device),
         precision=precision,
+        basics_impl=basics_impl,
     )
 
 
@@ -234,6 +311,7 @@ def print_result(result: BenchmarkResult, output_format: str) -> None:
         ("std_ms", f"{result.std_ms:.3f}"),
         ("device", result.device),
         ("precision", result.precision),
+        ("basics_impl", result.basics_impl),
     ]
     width = max(len(name) for name, _ in rows)
     for name, value in rows:
@@ -249,7 +327,7 @@ def main() -> None:
     device = torch.device(args.device)
 
     config = get_model_config(args.model_size, args.context_length)
-    model = build_model(config, device)
+    model = build_model(config, device, args.basics_impl, args.assignment1_path)
     model.eval() if args.mode == "forward" else model.train()
 
     batch = make_batch(
@@ -258,7 +336,7 @@ def main() -> None:
         vocab_size=config.vocab_size,
         device=device,
     )
-    optimizer = build_optimizer(model) if args.mode in {"forward_backward", "train_step"} else None
+    optimizer = build_optimizer(model, args.basics_impl, args.assignment1_path) if args.mode in {"forward_backward", "train_step"} else None
 
     result = benchmark(
         model=model,
@@ -272,6 +350,7 @@ def main() -> None:
         context_length=args.context_length,
         device=device,
         precision=args.precision,
+        basics_impl=args.basics_impl,
     )
     print_result(result, args.output_format)
 

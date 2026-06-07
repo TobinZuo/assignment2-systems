@@ -22,6 +22,11 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--measure-steps", type=int, default=10)
     parser.add_argument("--device", default="cuda")
     parser.add_argument("--precision", choices=["fp32"], default="fp32")
+    parser.add_argument("--basics-impl", choices=["staff", "user-adapters"], default="staff")
+    parser.add_argument(
+        "--assignment1-path",
+        default="/mnt/bn/ai-infra-aigc-my/mlx/users/zuotongbin.tobin/playground/assignment1-basics",
+    )
     parser.add_argument("--seed", type=int, default=0)
     parser.add_argument("--output-csv", type=Path, default=Path("benchmark_results.csv"))
     parser.add_argument("--output-md", type=Path, default=Path("benchmark_results.md"))
@@ -49,6 +54,10 @@ def run_one(args: argparse.Namespace, model_size: str, mode: str) -> dict:
         args.device,
         "--precision",
         args.precision,
+        "--basics-impl",
+        args.basics_impl,
+        "--assignment1-path",
+        args.assignment1_path,
         "--seed",
         str(args.seed),
         "--output-format",
@@ -70,6 +79,7 @@ def run_one(args: argparse.Namespace, model_size: str, mode: str) -> dict:
         "std_ms": "",
         "device": args.device,
         "precision": args.precision,
+        "basics_impl": args.basics_impl,
         "error": (completed.stderr or completed.stdout).strip().splitlines()[-1],
     }
 
@@ -86,6 +96,7 @@ def write_csv(path: Path, rows: list[dict]) -> None:
         "std_ms",
         "device",
         "precision",
+        "basics_impl",
         "error",
     ]
     with path.open("w", newline="") as f:
