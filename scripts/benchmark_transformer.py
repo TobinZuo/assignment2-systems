@@ -1,6 +1,8 @@
 from __future__ import annotations
 
 import argparse
+import contextlib
+import inspect
 import importlib.util
 import json
 import statistics
@@ -16,6 +18,7 @@ import torch.nn.functional as F
 
 Mode = Literal["forward", "forward_backward", "train_step"]
 BasicsImpl = Literal["staff", "user-adapters"]
+Precision = Literal["fp32", "fp16", "bf16"]
 
 
 @dataclass(frozen=True)
@@ -41,6 +44,11 @@ class BenchmarkResult:
     device: str
     precision: str
     basics_impl: str
+    peak_allocated_bytes: int | None = None
+    peak_reserved_bytes: int | None = None
+    peak_allocated_mib: float | None = None
+    peak_reserved_mib: float | None = None
+    memory_snapshot_path: str | None = None
 
 
 def parse_args() -> argparse.Namespace:
@@ -52,7 +60,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--warmup-steps", type=int, default=5)
     parser.add_argument("--measure-steps", type=int, default=10)
     parser.add_argument("--device", default="cuda" if torch.cuda.is_available() else "cpu")
-    parser.add_argument("--precision", choices=["fp32"], default="fp32")
+    parser.add_argument("--precision", choices=["fp32", "fp16", "bf16"], default="fp32")
     parser.add_argument("--basics-impl", choices=["staff", "user-adapters"], default="staff")
     parser.add_argument(
         "--assignment1-path",
@@ -61,6 +69,24 @@ def parse_args() -> argparse.Namespace:
     )
     parser.add_argument("--seed", type=int, default=0)
     parser.add_argument("--output-format", choices=["table", "json"], default="table")
+    parser.add_argument("--nvtx", action="store_true", help="Emit NVTX ranges for Nsight Systems profiling.")
+    parser.add_argument(
+        "--profile-memory",
+        action="store_true",
+        help="Record PyTorch CUDA allocator peak stats for measured steps, after warmup.",
+    )
+    parser.add_argument(
+        "--memory-snapshot-path",
+        type=Path,
+        default=None,
+        help="Optional .pickle output for torch.cuda.memory._dump_snapshot, viewable in https://pytorch.org/memory_viz.",
+    )
+    parser.add_argument(
+        "--memory-history-max-entries",
+        type=int,
+        default=200_000,
+        help="Maximum allocator events kept in the PyTorch memory history snapshot.",
+    )
     return parser.parse_args()
 
 
@@ -184,9 +210,53 @@ def build_optimizer(model: torch.nn.Module, basics_impl: BasicsImpl, assignment1
     return AdamW(model.parameters(), lr=1e-3)
 
 
-def compute_loss(model: torch.nn.Module, input_ids: torch.Tensor, targets: torch.Tensor) -> torch.Tensor:
-    logits = model(input_ids)
-    return F.cross_entropy(logits.flatten(0, 1), targets.flatten())
+@contextlib.contextmanager
+def nvtx_range(name: str, enabled: bool):
+    if enabled and torch.cuda.is_available():
+        torch.cuda.nvtx.range_push(name)
+        try:
+            yield
+        finally:
+            torch.cuda.nvtx.range_pop()
+    else:
+        yield
+
+
+def compute_loss(model: torch.nn.Module, input_ids: torch.Tensor, targets: torch.Tensor, emit_nvtx: bool) -> torch.Tensor:
+    with nvtx_range("model_forward", emit_nvtx):
+        logits = model(input_ids)
+    with nvtx_range("loss", emit_nvtx):
+        return F.cross_entropy(logits.flatten(0, 1), targets.flatten())
+
+
+def autocast_dtype(precision: Precision) -> torch.dtype | None:
+    if precision == "fp16":
+        return torch.float16
+    if precision == "bf16":
+        return torch.bfloat16
+    return None
+
+
+@contextlib.contextmanager
+def precision_context(device: torch.device, precision: Precision):
+    dtype = autocast_dtype(precision)
+    if dtype is None:
+        yield
+        return
+    if device.type not in {"cuda", "cpu"}:
+        raise ValueError(f"Autocast precision {precision} is only supported for CPU/CUDA devices, got {device}.")
+    with torch.autocast(device_type=device.type, dtype=dtype):
+        yield
+
+
+def make_grad_scaler(device: torch.device, precision: Precision, mode: Mode):
+    enabled = device.type == "cuda" and precision == "fp16" and mode in {"forward_backward", "train_step"}
+    if hasattr(torch, "amp") and hasattr(torch.amp, "GradScaler"):
+        try:
+            return torch.amp.GradScaler("cuda", enabled=enabled)
+        except TypeError:
+            return torch.amp.GradScaler(enabled=enabled)
+    return torch.cuda.amp.GradScaler(enabled=enabled)
 
 
 def run_one_step(
@@ -194,27 +264,52 @@ def run_one_step(
     batch: tuple[torch.Tensor, torch.Tensor],
     optimizer: torch.optim.Optimizer | None,
     mode: Mode,
+    device: torch.device,
+    precision: Precision,
+    grad_scaler,
+    emit_nvtx: bool,
 ) -> torch.Tensor | None:
     input_ids, targets = batch
 
     if mode == "forward":
-        with torch.no_grad():
-            return compute_loss(model, input_ids, targets)
+        with torch.no_grad(), nvtx_range("forward", emit_nvtx):
+            with precision_context(device, precision):
+                return compute_loss(model, input_ids, targets, emit_nvtx)
 
     if mode == "forward_backward":
-        if optimizer is not None:
-            optimizer.zero_grad(set_to_none=True)
-        loss = compute_loss(model, input_ids, targets)
-        loss.backward()
+        with nvtx_range("zero_grad", emit_nvtx):
+            if optimizer is not None:
+                optimizer.zero_grad(set_to_none=True)
+        with nvtx_range("forward", emit_nvtx):
+            with precision_context(device, precision):
+                loss = compute_loss(model, input_ids, targets, emit_nvtx)
+        with nvtx_range("backward", emit_nvtx):
+            if grad_scaler.is_enabled():
+                grad_scaler.scale(loss).backward()
+            else:
+                loss.backward()
         return loss
 
     if mode == "train_step":
         if optimizer is None:
             raise ValueError("train_step mode requires an optimizer.")
-        optimizer.zero_grad(set_to_none=True)
-        loss = compute_loss(model, input_ids, targets)
-        loss.backward()
-        optimizer.step()
+        with nvtx_range("train_step", emit_nvtx):
+            with nvtx_range("zero_grad", emit_nvtx):
+                optimizer.zero_grad(set_to_none=True)
+            with nvtx_range("forward", emit_nvtx):
+                with precision_context(device, precision):
+                    loss = compute_loss(model, input_ids, targets, emit_nvtx)
+            with nvtx_range("backward", emit_nvtx):
+                if grad_scaler.is_enabled():
+                    grad_scaler.scale(loss).backward()
+                else:
+                    loss.backward()
+            with nvtx_range("optimizer_step", emit_nvtx):
+                if grad_scaler.is_enabled():
+                    grad_scaler.step(optimizer)
+                    grad_scaler.update()
+                else:
+                    optimizer.step()
         return loss
 
     raise ValueError(f"Unsupported mode: {mode}")
@@ -225,16 +320,71 @@ def synchronize(device: torch.device) -> None:
         torch.cuda.synchronize(device)
 
 
+def mib(num_bytes: int) -> float:
+    return num_bytes / (1024 * 1024)
+
+
+@contextlib.contextmanager
+def cuda_memory_history(
+    enabled: bool,
+    device: torch.device,
+    snapshot_path: Path | None,
+    max_entries: int,
+):
+    if not enabled:
+        yield None
+        return
+    if device.type != "cuda":
+        raise ValueError("--profile-memory requires a CUDA device.")
+    if not hasattr(torch.cuda.memory, "_record_memory_history") or not hasattr(torch.cuda.memory, "_dump_snapshot"):
+        raise RuntimeError("This PyTorch build does not expose CUDA memory snapshot APIs.")
+
+    if snapshot_path is not None:
+        snapshot_path.parent.mkdir(parents=True, exist_ok=True)
+
+    record_kwargs = {
+        "enabled": "all",
+        "context": "all",
+        "stacks": "all",
+        "max_entries": max_entries,
+        "device": device,
+        "clear_history": True,
+    }
+    supported = set(inspect.signature(torch.cuda.memory._record_memory_history).parameters)
+    record_kwargs = {key: value for key, value in record_kwargs.items() if key in supported}
+    torch.cuda.memory._record_memory_history(**record_kwargs)
+    try:
+        yield snapshot_path
+    finally:
+        if snapshot_path is not None:
+            torch.cuda.memory._dump_snapshot(str(snapshot_path))
+        torch.cuda.memory._record_memory_history(enabled=None)
+
+
 def time_one_step(
     model: torch.nn.Module,
     batch: tuple[torch.Tensor, torch.Tensor],
     optimizer: torch.optim.Optimizer | None,
     mode: Mode,
     device: torch.device,
+    precision: Precision,
+    grad_scaler,
+    emit_nvtx: bool,
+    step_label: str,
 ) -> float:
     synchronize(device)
     start = time.perf_counter()
-    run_one_step(model=model, batch=batch, optimizer=optimizer, mode=mode)
+    with nvtx_range(step_label, emit_nvtx):
+        run_one_step(
+            model=model,
+            batch=batch,
+            optimizer=optimizer,
+            mode=mode,
+            device=device,
+            precision=precision,
+            grad_scaler=grad_scaler,
+            emit_nvtx=emit_nvtx,
+        )
     synchronize(device)
     end = time.perf_counter()
     return (end - start) * 1_000
@@ -247,9 +397,22 @@ def run_warmup(
     optimizer: torch.optim.Optimizer | None,
     mode: Mode,
     device: torch.device,
+    precision: Precision,
+    grad_scaler,
+    emit_nvtx: bool,
 ) -> None:
-    for _ in range(warmup_steps):
-        time_one_step(model=model, batch=batch, optimizer=optimizer, mode=mode, device=device)
+    for step_idx in range(warmup_steps):
+        time_one_step(
+            model=model,
+            batch=batch,
+            optimizer=optimizer,
+            mode=mode,
+            device=device,
+            precision=precision,
+            grad_scaler=grad_scaler,
+            emit_nvtx=emit_nvtx,
+            step_label=f"warmup_step_{step_idx}",
+        )
 
 
 def benchmark(
@@ -263,9 +426,14 @@ def benchmark(
     batch_size: int,
     context_length: int,
     device: torch.device,
-    precision: str,
+    precision: Precision,
     basics_impl: str,
+    emit_nvtx: bool,
+    profile_memory: bool,
+    memory_snapshot_path: Path | None,
+    memory_history_max_entries: int,
 ) -> BenchmarkResult:
+    grad_scaler = make_grad_scaler(device, precision, mode)
     run_warmup(
         warmup_steps=warmup_steps,
         model=model,
@@ -273,12 +441,47 @@ def benchmark(
         optimizer=optimizer,
         mode=mode,
         device=device,
+        precision=precision,
+        grad_scaler=grad_scaler,
+        emit_nvtx=emit_nvtx,
     )
 
-    step_times_ms = [
-        time_one_step(model=model, batch=batch, optimizer=optimizer, mode=mode, device=device)
-        for _ in range(measure_steps)
-    ]
+    peak_allocated_bytes = None
+    peak_reserved_bytes = None
+    snapshot_output_path = str(memory_snapshot_path) if memory_snapshot_path is not None else None
+
+    synchronize(device)
+    if profile_memory:
+        if device.type != "cuda":
+            raise ValueError("--profile-memory requires a CUDA device.")
+        torch.cuda.reset_peak_memory_stats(device)
+
+    step_times_ms = []
+    with cuda_memory_history(
+        enabled=profile_memory and memory_snapshot_path is not None,
+        device=device,
+        snapshot_path=memory_snapshot_path,
+        max_entries=memory_history_max_entries,
+    ):
+        for step_idx in range(measure_steps):
+            step_times_ms.append(
+                time_one_step(
+                    model=model,
+                    batch=batch,
+                    optimizer=optimizer,
+                    mode=mode,
+                    device=device,
+                    precision=precision,
+                    grad_scaler=grad_scaler,
+                    emit_nvtx=emit_nvtx,
+                    step_label=f"measure_step_{step_idx}",
+                )
+            )
+
+    synchronize(device)
+    if profile_memory:
+        peak_allocated_bytes = torch.cuda.max_memory_allocated(device)
+        peak_reserved_bytes = torch.cuda.max_memory_reserved(device)
 
     return BenchmarkResult(
         model_size=model_size,
@@ -292,6 +495,11 @@ def benchmark(
         device=str(device),
         precision=precision,
         basics_impl=basics_impl,
+        peak_allocated_bytes=peak_allocated_bytes,
+        peak_reserved_bytes=peak_reserved_bytes,
+        peak_allocated_mib=mib(peak_allocated_bytes) if peak_allocated_bytes is not None else None,
+        peak_reserved_mib=mib(peak_reserved_bytes) if peak_reserved_bytes is not None else None,
+        memory_snapshot_path=snapshot_output_path,
     )
 
 
@@ -313,6 +521,15 @@ def print_result(result: BenchmarkResult, output_format: str) -> None:
         ("precision", result.precision),
         ("basics_impl", result.basics_impl),
     ]
+    if result.peak_allocated_bytes is not None:
+        rows.extend(
+            [
+                ("peak_allocated_mib", f"{result.peak_allocated_mib:.3f}"),
+                ("peak_reserved_mib", f"{result.peak_reserved_mib:.3f}"),
+            ]
+        )
+    if result.memory_snapshot_path is not None:
+        rows.append(("memory_snapshot_path", result.memory_snapshot_path))
     width = max(len(name) for name, _ in rows)
     for name, value in rows:
         print(f"{name:<{width}}  {value}")
@@ -320,9 +537,8 @@ def print_result(result: BenchmarkResult, output_format: str) -> None:
 
 def main() -> None:
     args = parse_args()
-    if args.precision != "fp32":
-        raise NotImplementedError("First version only supports --precision fp32.")
-
+    if args.memory_snapshot_path is not None:
+        args.profile_memory = True
     torch.manual_seed(args.seed)
     device = torch.device(args.device)
 
@@ -351,6 +567,10 @@ def main() -> None:
         device=device,
         precision=args.precision,
         basics_impl=args.basics_impl,
+        emit_nvtx=args.nvtx,
+        profile_memory=args.profile_memory,
+        memory_snapshot_path=args.memory_snapshot_path,
+        memory_history_max_entries=args.memory_history_max_entries,
     )
     print_result(result, args.output_format)
 

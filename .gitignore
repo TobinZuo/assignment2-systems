@@ -2,6 +2,27 @@
 cs336-spring2024-assignment-2-submission.zip
 test_results.xml
 
+# Assignment 2 local profiling / raw worker outputs.
+memory_profiles/
+nsight_profiles/
+nsight_profiles_b2/
+diagrams/
+*.jsonl
+*.nsys-rep
+*.sqlite
+*.qdrep
+*.qdstrm
+*.pickle
+*.pkl
+h100_worker_touch.txt
+scripts/worker_touch.sh
+submit_smoke_*.json
+mixed_precision_probe_*.json
+benchmark_mixed_fp32_user-adapters.csv
+nsight_doc_update.xml
+nsight_diagrams_fallback.xml
+nsight_*_preview*.png
+
 # Byte-compiled / optimized / DLL files
 __pycache__/
 *.py[cod]

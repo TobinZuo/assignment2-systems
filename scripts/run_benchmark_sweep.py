@@ -10,6 +10,7 @@ from pathlib import Path
 
 MODEL_SIZES = ["small", "medium", "large", "xl"]
 MODES = ["forward", "forward_backward", "train_step"]
+PRECISIONS = ["fp32", "fp16", "bf16"]
 
 
 def parse_args() -> argparse.Namespace:
@@ -21,7 +22,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--warmup-steps", type=int, default=5)
     parser.add_argument("--measure-steps", type=int, default=10)
     parser.add_argument("--device", default="cuda")
-    parser.add_argument("--precision", choices=["fp32"], default="fp32")
+    parser.add_argument("--precision", choices=PRECISIONS, default="fp32")
     parser.add_argument("--basics-impl", choices=["staff", "user-adapters"], default="staff")
     parser.add_argument(
         "--assignment1-path",
@@ -85,33 +86,39 @@ def run_one(args: argparse.Namespace, model_size: str, mode: str) -> dict:
 
 
 def write_csv(path: Path, rows: list[dict]) -> None:
-    fieldnames = [
-        "model_size",
-        "mode",
-        "batch_size",
-        "context_length",
-        "warmup_steps",
-        "measure_steps",
-        "mean_ms",
-        "std_ms",
-        "device",
-        "precision",
-        "basics_impl",
-        "error",
-    ]
+    fieldnames = list(
+        dict.fromkeys(
+            [
+                "model_size",
+                "mode",
+                "batch_size",
+                "context_length",
+                "warmup_steps",
+                "measure_steps",
+                "mean_ms",
+                "std_ms",
+                "device",
+                "precision",
+                "basics_impl",
+                "error",
+            ]
+            + [key for row in rows for key in row]
+        )
+    )
     with path.open("w", newline="") as f:
-        writer = csv.DictWriter(f, fieldnames=fieldnames)
+        writer = csv.DictWriter(f, fieldnames=fieldnames, extrasaction="ignore")
         writer.writeheader()
         writer.writerows(rows)
 
 
 def write_markdown(path: Path, rows: list[dict]) -> None:
     by_key = {(row["model_size"], row["mode"]): row for row in rows}
+    model_sizes = list(dict.fromkeys(row["model_size"] for row in rows)) if rows else MODEL_SIZES
     lines = [
         "| Model | Forward Mean | Forward Std | Fwd+Bwd Mean | Fwd+Bwd Std | Train Step Mean | Train Step Std |",
         "|-|-|-|-|-|-|-|",
     ]
-    for model_size in MODEL_SIZES:
+    for model_size in model_sizes:
         forward = by_key.get((model_size, "forward"))
         fwd_bwd = by_key.get((model_size, "forward_backward"))
         train_step = by_key.get((model_size, "train_step"))
